@@ -4,17 +4,17 @@
 ;;; applies OS-suffix filtering, and produces a plan (list of link records).
 
 (define-module (ggstow plan)
+  #:use-module (srfi srfi-1)    ; append-map, any, fold, filter-map
+  #:use-module (srfi srfi-9)    ; define-record-type
+  #:use-module (srfi srfi-13)   ; string-suffix?, string-contains
+  #:use-module (ice-9 rdelim)   ; read-line
   #:use-module (ggstow variables)
-  #:use-module (ggstow fs)
-  #:use-module (ice-9 ftw)
-  #:use-module (ice-9 regex)
-  #:use-module (ice-9 string-fun)
-  #:use-module (srfi srfi-1)
   #:export (compute-plan
             display-plan
             apply-plan
             rollback-plan
-            display-status))
+            display-status
+            make-link link? link-source link-target link-package))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Link record
@@ -23,20 +23,21 @@
 (define-record-type <link>
   (make-link source target package)
   link?
-  (source  link-source)   ; absolute path in the repo
-  (target  link-target)   ; absolute path in $HOME
-  (package link-package)) ; package name (top-level dir under Configs/)
+  (source  link-source)    ; absolute path in the repo
+  (target  link-target)    ; absolute path in $HOME
+  (package link-package))  ; package name (top-level dir under Configs/)
 
 ;;; ---------------------------------------------------------------------------
 ;;; OS detection
 ;;; ---------------------------------------------------------------------------
 
 (define (current-os)
-  (let ((uname (uname)))
+  (let* ((sysname (utsname:sysname (uname))))
     (cond
-     ((string-contains (utsname:sysname uname) "Linux")   'linux)
-     ((string-contains (utsname:sysname uname) "Darwin")  'macos)
-     ((string-contains (utsname:sysname uname) "Windows") 'windows)
+     ((string-contains sysname "Linux")   'linux)
+     ((string-contains sysname "Darwin")  'macos)
+     ((string-contains sysname "MINGW")   'windows)
+     ((string-contains sysname "CYGWIN")  'windows)
      (else 'unknown))))
 
 (define (os-suffix os)
@@ -47,74 +48,30 @@
     (else      "")))
 
 ;;; ---------------------------------------------------------------------------
+;;; Directory listing (follows project patterns — opendir/readdir)
+;;; ---------------------------------------------------------------------------
+
+(define (list-dir path)
+  "Return sorted list of entries in PATH, excluding . and .."
+  (catch #t
+    (lambda ()
+      (let ((dir (opendir path)))
+        (let loop ((acc '()))
+          (let ((name (readdir dir)))
+            (if (eof-object? name)
+                (begin (closedir dir) (sort acc string<?))
+                (if (member name '("." ".."))
+                    (loop acc)
+                    (loop (cons name acc))))))))
+    (lambda (key . args)
+      (format (current-error-port) "ggstow: cannot read directory: ~a~%" path)
+      '())))
+
+;;; ---------------------------------------------------------------------------
 ;;; Package filtering
 ;;; ---------------------------------------------------------------------------
 
 (define *os-suffixes* '("_linux" "_macos" "_windows"))
-
-(define (package-active? pkg-name os)
-  "Return #t if PKG-NAME should be linked on OS."
-  (let ((suffix (os-suffix os)))
-    (cond
-     ;; Explicit OS suffix — only link if it matches
-     ((any (lambda (s) (string-suffix? s pkg-name)) *os-suffixes*)
-      (string-suffix? suffix pkg-name))
-     ;; No suffix — link on all platforms
-     (else #t))))
-
-(define (read-ignore-file dir)
-  "Return list of OS names to exclude from DIR/.ggstow-ignore, or '()."
-  (let ((ignore-path (string-append dir "/.ggstow-ignore")))
-    (if (file-exists? ignore-path)
-        (call-with-input-file ignore-path
-          (lambda (port)
-            (let loop ((line (read-line port)) (acc '()))
-              (if (eof-object? line)
-                  acc
-                  (loop (read-line port)
-                        (cons (string-trim-right line) acc))))))
-        '())))
-
-(define (package-ignored? pkg-dir os)
-  "Return #t if OS is listed in PKG-DIR/.ggstow-ignore."
-  (let ((excluded (read-ignore-file pkg-dir))
-        (os-name  (symbol->string os)))
-    (member os-name excluded)))
-
-;;; ---------------------------------------------------------------------------
-;;; Plan computation
-;;; ---------------------------------------------------------------------------
-
-(define (configs-dir config)
-  "Resolve the Configs/ directory from the config file location."
-  (let ((base (dirname (if (string? config) config (getcwd)))))
-    (string-append base "/Configs")))
-
-(define (compute-plan config)
-  "Scan Configs/ and return a list of <link> records."
-  (let* ((os      (current-os))
-         (configs (configs-dir config))
-         (home    (getenv "HOME")))
-    (if (not (file-exists? configs))
-        (error "ggstow: Configs/ directory not found" configs)
-        (scan-packages configs home os))))
-
-(define (scan-packages configs-dir home os)
-  (let ((packages (scandir configs-dir
-                           (lambda (f)
-                             (and (not (string=? f "."))
-                                  (not (string=? f ".."))
-                                  (eq? 'directory
-                                       (stat:type (stat (string-append configs-dir "/" f)))))))))
-    (append-map
-     (lambda (pkg)
-       (let* ((pkg-dir    (string-append configs-dir "/" pkg))
-              (pkg-name   (strip-os-suffix pkg)))
-         (if (or (not (package-active? pkg os))
-                 (package-ignored? pkg-dir os))
-             '()
-             (scan-package pkg-dir home os pkg-name))))
-     (or packages '()))))
 
 (define (strip-os-suffix name)
   (fold (lambda (suffix acc)
@@ -123,33 +80,98 @@
               acc))
         name *os-suffixes*))
 
+(define (package-active? pkg-name os)
+  "Return #t if PKG-NAME should be linked on OS."
+  (let ((suffix (os-suffix os)))
+    (if (any (lambda (s) (string-suffix? s pkg-name)) *os-suffixes*)
+        ;; Has an explicit OS suffix — only match current OS
+        (string-suffix? suffix pkg-name)
+        ;; No suffix — active on all platforms
+        #t)))
+
+(define (read-ignore-file dir)
+  "Return list of OS name strings from DIR/.ggstow-ignore, or '()."
+  (let ((path (string-append dir "/.ggstow-ignore")))
+    (if (file-exists? path)
+        (call-with-input-file path
+          (lambda (port)
+            (let loop ((line (read-line port)) (acc '()))
+              (if (eof-object? line)
+                  acc
+                  (let ((trimmed (string-trim-right line)))
+                    (loop (read-line port)
+                          (if (string-null? trimmed)
+                              acc
+                              (cons trimmed acc))))))))
+        '())))
+
+(define (package-ignored? pkg-dir os)
+  "Return #t if current OS is listed in PKG-DIR/.ggstow-ignore."
+  (member (symbol->string os) (read-ignore-file pkg-dir)))
+
+;;; ---------------------------------------------------------------------------
+;;; Config root resolution
+;;; ---------------------------------------------------------------------------
+
+(define (configs-dir config-path)
+  "Resolve the Configs/ directory from the config file path (or cwd)."
+  (let* ((base (if (string? config-path)
+                   (let ((d (string-append
+                             (substring config-path 0
+                                        (let loop ((i (- (string-length config-path) 1)))
+                                          (cond ((< i 0) 0)
+                                                ((char=? (string-ref config-path i) #\/) i)
+                                                (else (loop (- i 1)))))))))
+                     (if (string=? d "") "." d))
+                   (getcwd))))
+    (string-append base "/Configs")))
+
+;;; ---------------------------------------------------------------------------
+;;; Plan computation
+;;; ---------------------------------------------------------------------------
+
+(define (compute-plan config)
+  "Scan Configs/ and return a list of <link> records."
+  (let* ((os      (current-os))
+         (configs (configs-dir config))
+         (home    (or (getenv "HOME") (error "ggstow: HOME not set"))))
+    (unless (file-exists? configs)
+      (error "ggstow: Configs/ directory not found" configs))
+    (scan-packages configs home os)))
+
+(define (scan-packages configs-dir home os)
+  (let ((pkgs (list-dir configs-dir)))
+    (append-map
+     (lambda (pkg)
+       (let ((pkg-dir (string-append configs-dir "/" pkg)))
+         (if (and (eq? 'directory (stat:type (stat pkg-dir)))
+                  (package-active? pkg os)
+                  (not (package-ignored? pkg-dir os)))
+             (scan-package pkg-dir home os (strip-os-suffix pkg))
+             '())))
+     pkgs)))
+
 (define (scan-package pkg-dir home os pkg-name)
-  "Walk PKG-DIR, resolving %VAR% dirs, and produce link records."
-  (let loop ((dir    pkg-dir)
-             (target home)
-             (links  '()))
-    (let ((entries (scandir dir (lambda (f)
-                                  (and (not (string=? f "."))
-                                       (not (string=? f ".."))
-                                       (not (string=? f ".ggstow-ignore")))))))
-      (fold
-       (lambda (entry acc)
-         (let* ((src      (string-append dir "/" entry))
+  "Walk PKG-DIR recursively, building link records."
+  (let walk ((src-dir pkg-dir) (tgt-dir home))
+    (append-map
+     (lambda (entry)
+       (cond
+        ;; Always skip ignore file
+        ((string=? entry ".ggstow-ignore") '())
+        (else
+         (let* ((src      (string-append src-dir "/" entry))
                 (resolved (resolve-variable entry os))
-                (tgt      (string-append target "/" resolved))
+                (tgt      (string-append tgt-dir "/" resolved))
                 (type     (stat:type (stat src))))
            (cond
-            ;; %VAR% directory — recurse into it
-            ((and (eq? type 'directory) (variable-dir? entry))
-             (loop src tgt acc))
-            ;; Regular directory — recurse
+            ;; Directory (including %VAR% dirs) — recurse, don't link the dir itself
             ((eq? type 'directory)
-             (loop src tgt acc))
-            ;; File — emit a link record
+             (walk src tgt))
+            ;; Regular file or symlink — emit a link record
             (else
-             (cons (make-link src tgt pkg-name) acc)))))
-       links
-       (or entries '())))))
+             (list (make-link src tgt pkg-name))))))))
+     (list-dir src-dir))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Display
@@ -160,21 +182,18 @@
       (display "ggstow: nothing to link.\n")
       (for-each
        (lambda (link)
-         (format #t "  ~a\n    -> ~a\n"
+         (format #t "  [~a] ~a\n        -> ~a\n"
+                 (link-package link)
                  (link-target link)
                  (link-source link)))
        plan)))
 
 (define (display-status plan verbose?)
+  (use-modules (ggstow fs))
   (for-each
    (lambda (link)
-     (let* ((tgt    (link-target link))
-            (state  (cond
-                     ((not (file-exists? tgt))     "MISSING")
-                     ((not (eq? 'symlink (stat:type (lstat tgt)))) "NOT-LINK")
-                     ((string=? (readlink tgt) (link-source link))  "OK")
-                     (else "MISMATCH"))))
-       (format #t "  [~a] ~a\n" state tgt)))
+     (let ((state (link-status (link-target link) (link-source link))))
+       (format #t "  [~a] ~a\n" state (link-target link))))
    plan))
 
 ;;; ---------------------------------------------------------------------------
@@ -182,12 +201,15 @@
 ;;; ---------------------------------------------------------------------------
 
 (define (apply-plan plan dry-run? overwrite? verbose?)
+  (use-modules (ggstow fs))
   (for-each
    (lambda (link)
-     (create-link (link-source link) (link-target link) dry-run? overwrite? verbose?))
+     (create-link (link-source link) (link-target link)
+                  dry-run? overwrite? verbose?))
    plan))
 
 (define (rollback-plan plan dry-run? verbose?)
+  (use-modules (ggstow fs))
   (for-each
    (lambda (link)
      (remove-link (link-target link) dry-run? verbose?))

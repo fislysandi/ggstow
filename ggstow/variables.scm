@@ -5,20 +5,21 @@
 ;;; Scheme alist. Additional mappings can be declared in .ggstow.scm.
 
 (define-module (ggstow variables)
-  #:use-module (ice-9 regex)
+  #:use-module (ice-9 regex)    ; make-regexp, regexp-exec, match:substring
   #:export (variable-dir?
             resolve-variable
             register-variable!
-            default-variables))
+            default-variables
+            default-variable))  ; exported for tests
 
 ;;; ---------------------------------------------------------------------------
-;;; Built-in variable table
+;;; Variable registry
 ;;; ---------------------------------------------------------------------------
 
 (define *variable-table* '())
 
 (define (register-variable! name resolver)
-  "Register a variable NAME with a RESOLVER thunk (no args → string)."
+  "Register variable NAME with RESOLVER (thunk → string)."
   (set! *variable-table*
         (cons (cons name resolver) *variable-table*)))
 
@@ -33,17 +34,21 @@
 (define *var-rx* (make-regexp "^%[A-Z0-9_]+%$"))
 
 (define (variable-dir? name)
-  "Return #t if NAME is a %VARIABLE% style token."
+  "Return match object (truthy) if NAME is a %VARIABLE% token."
   (regexp-exec *var-rx* name))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Resolution
 ;;; ---------------------------------------------------------------------------
 
+(define *extract-rx* (make-regexp "%([A-Z0-9_]+)%"))
+
 (define (resolve-variable token os)
-  "Resolve TOKEN (may contain %VAR%) to a concrete path segment."
-  (let ((match (regexp-exec (make-regexp "%([A-Z0-9_]+)%") token)))
-    (if match
+  "Resolve TOKEN — if it contains %VAR%, expand it to a path.
+   Falls back to: registered variable → env var → default-variable → token."
+  (let ((match (regexp-exec *extract-rx* token)))
+    (if (not match)
+        token  ; no variable in this token, return as-is
         (let* ((var-name (match:substring match 1))
                (resolved (or (lookup-variable var-name)
                              (getenv var-name)
@@ -52,33 +57,43 @@
               resolved
               (begin
                 (format (current-error-port)
-                        "ggstow: warning: unresolved variable %~a%~%" var-name)
-                token)))
-        token)))
+                        "ggstow: warning: unresolved variable %~a%, using token as-is~%"
+                        var-name)
+                token))))))
 
 ;;; ---------------------------------------------------------------------------
-;;; Default variable definitions
+;;; Default variable table
 ;;; ---------------------------------------------------------------------------
 
-(define (home) (getenv "HOME"))
-(define (appdata) (or (getenv "APPDATA") (string-append (home) "/AppData/Roaming")))
-(define (localappdata) (or (getenv "LOCALAPPDATA") (string-append (home) "/AppData/Local")))
-(define (xdg-config) (or (getenv "XDG_CONFIG_HOME") (string-append (home) "/.config")))
+(define (home)
+  (or (getenv "HOME") (error "ggstow: HOME is not set")))
+
+(define (xdg-config)
+  (or (getenv "XDG_CONFIG_HOME")
+      (string-append (home) "/.config")))
+
+(define (appdata)
+  (or (getenv "APPDATA")
+      (string-append (home) "/AppData/Roaming")))
+
+(define (localappdata)
+  (or (getenv "LOCALAPPDATA")
+      (string-append (home) "/AppData/Local")))
 
 (define (default-variable var os)
-  "Return a path for VAR on OS, or #f if unknown."
+  "Return a concrete path for VAR on OS, or #f if unknown."
   (case (string->symbol var)
 
     ;; --- Nushell ---
     ((NU_HOME)
      (case os
-       ((windows) (string-append appdata "/nushell"))
+       ((windows) (string-append (appdata) "/nushell"))
        (else      (string-append (xdg-config) "/nushell"))))
 
     ;; --- Neovim ---
     ((NVIM_CONFIG)
      (case os
-       ((windows) (string-append localappdata "/nvim"))
+       ((windows) (string-append (localappdata) "/nvim"))
        (else      (string-append (xdg-config) "/nvim"))))
 
     ;; --- VS Code ---
@@ -86,13 +101,13 @@
      (case os
        ((linux)   (string-append (xdg-config) "/Code/User"))
        ((macos)   (string-append (home) "/Library/Application Support/Code/User"))
-       ((windows) (string-append appdata "/Code/User"))
+       ((windows) (string-append (appdata) "/Code/User"))
        (else      (string-append (xdg-config) "/Code/User"))))
 
     ;; --- MPV ---
     ((MPV_HOME)
      (case os
-       ((windows) (string-append appdata "/mpv"))
+       ((windows) (string-append (appdata) "/mpv"))
        (else      (string-append (xdg-config) "/mpv"))))
 
     ;; --- Blender ---
@@ -100,29 +115,30 @@
      (case os
        ((linux)   (string-append (xdg-config) "/blender"))
        ((macos)   (string-append (home) "/Library/Application Support/Blender"))
-       ((windows) (string-append appdata "/Blender Foundation/Blender"))
+       ((windows) (string-append (appdata) "/Blender Foundation/Blender"))
        (else      (string-append (xdg-config) "/blender"))))
 
     ;; --- Yazi ---
     ((YAZI_CONFIG)
      (case os
-       ((windows) (string-append appdata "/yazi/config"))
+       ((windows) (string-append (appdata) "/yazi/config"))
        (else      (string-append (xdg-config) "/yazi"))))
 
     ;; --- Nyxt ---
     ((NYXT_HOME)
      (case os
-       ((windows) (string-append appdata "/nyxt"))
+       ((windows) (string-append (appdata) "/nyxt"))
        (else
-        ;; Prefer Flatpak path if present
-        (let ((flatpak (string-append (home) "/.var/app/engineer.atlas.Nyxt/config/nyxt")))
-          (if (file-exists? (string-append (home) "/.var/app/engineer.atlas.Nyxt"))
-              flatpak
+        (let ((flatpak (string-append (home)
+                                      "/.var/app/engineer.atlas.Nyxt")))
+          (if (file-exists? flatpak)
+              (string-append flatpak "/config/nyxt")
               (string-append (xdg-config) "/nyxt"))))))
 
     ;; --- Windows Terminal ---
     ((WT_CONFIG_DIR)
-     (string-append localappdata "/Packages/Microsoft.WindowsTerminal_8wekyb3d8bbwe/LocalState"))
+     (string-append (localappdata)
+                    "/Packages/Microsoft.WindowsTerminal_8wekyb3d8bbwe/LocalState"))
 
     ;; --- PowerShell ---
     ((PS_PROFILE_DIR)
@@ -137,5 +153,5 @@
     (else #f)))
 
 (define (default-variables)
-  "Return the list of all registered variable names."
+  "Return list of registered variable names."
   (map car *variable-table*))
