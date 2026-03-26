@@ -1,0 +1,15 @@
+# Guile compiled bytecode
+*.go
+*.gox
+**/__pycache__/
+
+# Guile REPL history
+.guile_history
+
+# Test output
+/test-output/
+
+# Editor
+.dir-locals.el
+*.swp
+.DS_Store
